@@ -1,13 +1,7 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-trixie
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    libgl1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -22,7 +16,7 @@ RUN groupadd --system appgroup \
     && chown -R appuser:appgroup /app \
     && chmod +x /usr/local/bin/docker-entrypoint.sh
 
-USER root
+USER appuser
 
 EXPOSE 9000
 
