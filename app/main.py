@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from .config import settings
-from .processing import clear_model_cache, extract_video_frame, process_image, process_video
+from .processing import clear_model_cache, extract_video_frame, ort_runtime_info, prewarm_models, process_image, process_video
 from .schemas import FrameResponse, HealthResponse, ProcessResponse
 from .security import (
     assert_internal_token,
@@ -34,6 +35,9 @@ app.add_middleware(
 JOBS: dict[str, dict] = {}
 JOB_INDEX_DIR = settings.workdir / "job-index"
 JOB_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+PROCESS_SEMAPHORE = threading.BoundedSemaphore(max(1, int(settings.engine_max_concurrent_jobs)))
+ACTIVE_PROCESS_COUNT = 0
+PROCESS_COUNT_LOCK = threading.Lock()
 
 
 def _manifest_path(job_id: str) -> Path:
@@ -85,6 +89,32 @@ def _cleanup_job_files(path: Path):
 
 def _auth(x_engine_token: str | None = Header(default=None)):
     assert_internal_token(x_engine_token, settings.engine_shared_token)
+
+
+def _processing_slot():
+    global ACTIVE_PROCESS_COUNT
+    wait_sec = max(0.0, float(settings.engine_queue_wait_seconds))
+    acquired = PROCESS_SEMAPHORE.acquire(timeout=wait_sec)
+    if not acquired:
+        raise HTTPException(
+            status_code=429,
+            detail="Engine is busy. Retry shortly.",
+        )
+    with PROCESS_COUNT_LOCK:
+        ACTIVE_PROCESS_COUNT += 1
+    try:
+        yield
+    finally:
+        with PROCESS_COUNT_LOCK:
+            ACTIVE_PROCESS_COUNT = max(0, ACTIVE_PROCESS_COUNT - 1)
+        PROCESS_SEMAPHORE.release()
+
+
+@app.on_event("startup")
+def _startup_prewarm():
+    if not settings.engine_prewarm_on_startup:
+        return
+    prewarm_models(settings.engine_prewarm_quality)
 
 
 def _clean_old_jobs():
@@ -146,13 +176,30 @@ def health():
     return HealthResponse(status="ok", app=settings.app_name)
 
 
-@app.post("/v1/process/image", response_model=ProcessResponse, dependencies=[Depends(_auth)])
+@app.get("/v1/stats", dependencies=[Depends(_auth)])
+def engine_stats():
+    with PROCESS_COUNT_LOCK:
+        active = int(ACTIVE_PROCESS_COUNT)
+    max_jobs = max(1, int(settings.engine_max_concurrent_jobs))
+    pending = max(0, len(JOBS))
+    return {
+        "status": "ok",
+        "active_processing_jobs": active,
+        "max_concurrent_jobs": max_jobs,
+        "queue_wait_seconds": float(settings.engine_queue_wait_seconds),
+        "registered_jobs": pending,
+        "runtime": ort_runtime_info(),
+    }
+
+
+@app.post("/v1/process/image", response_model=ProcessResponse, dependencies=[Depends(_auth), Depends(_processing_slot)])
 def process_image_endpoint(
     file: UploadFile = File(...),
     quality: str = Form(default="ultra"),
     bg_color: str = Form(default="transparent"),
     keep_mask_data_url: str | None = Form(default=None),
     erase_mask_data_url: str | None = Form(default=None),
+    watermark_enabled: bool | None = Form(default=None),
 ):
     quality = "ultra" if quality not in {"ultra", "balanced"} else quality
     bg_rgb = parse_hex_color(bg_color)
@@ -174,6 +221,7 @@ def process_image_endpoint(
         erase_mask=erase_mask,
         keep_mask=keep_mask,
         bg_rgb=bg_rgb,
+        watermark_enabled=watermark_enabled,
     )
     job_id = _register_job(output, output_name=output_name, output_mime=result["output_mime"], media_type="image")
     return ProcessResponse(
@@ -189,13 +237,14 @@ def process_image_endpoint(
     )
 
 
-@app.post("/v1/process/video", response_model=ProcessResponse, dependencies=[Depends(_auth)])
+@app.post("/v1/process/video", response_model=ProcessResponse, dependencies=[Depends(_auth), Depends(_processing_slot)])
 def process_video_endpoint(
     file: UploadFile = File(...),
     quality: str = Form(default="ultra"),
     bg_color: str = Form(default="transparent"),
     keep_mask_data_url: str | None = Form(default=None),
     erase_mask_data_url: str | None = Form(default=None),
+    watermark_enabled: bool | None = Form(default=None),
 ):
     quality = "ultra" if quality not in {"ultra", "balanced"} else quality
     bg_rgb = parse_hex_color(bg_color)
@@ -219,6 +268,7 @@ def process_video_endpoint(
         erase_mask=erase_mask,
         keep_mask=keep_mask,
         bg_rgb=bg_rgb,
+        watermark_enabled=watermark_enabled,
     )
     job_id = _register_job(output, output_name=output_name, output_mime=mime, media_type="video")
     return ProcessResponse(
@@ -265,3 +315,12 @@ def download_job(job_id: str):
 def clear_cache():
     clear_model_cache()
     return {"status": "ok"}
+
+
+@app.post("/v1/prewarm", dependencies=[Depends(_auth)])
+def prewarm_endpoint(quality: str | None = None):
+    normalized = None if quality is None or not quality.strip() else quality.strip().lower()
+    if normalized not in {None, "ultra", "balanced"}:
+        raise HTTPException(status_code=400, detail="quality must be ultra, balanced or empty.")
+    loaded = prewarm_models(normalized)
+    return {"status": "ok", "loaded_models": loaded}

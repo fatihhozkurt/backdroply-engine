@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hmac
 import io
 import re
 from pathlib import Path
@@ -161,7 +162,7 @@ def data_url_to_gray_mask(data_url: str | None) -> np.ndarray | None:
 
 
 def assert_internal_token(token: str | None, expected: str):
-    if not token or token != expected:
+    if not token or not hmac.compare_digest(str(token), str(expected)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized engine access.",

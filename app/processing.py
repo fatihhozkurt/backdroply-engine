@@ -3,20 +3,23 @@ from __future__ import annotations
 import base64
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import imageio_ffmpeg
 import numpy as np
+import onnxruntime as ort
 from rembg import new_session, remove
 
 from .config import settings
 
-# Keep defaults light enough to avoid OOM/SIGKILL in constrained Docker hosts.
-# A single lightweight model is the safest default for local Docker memory limits.
-MODEL_CANDIDATES = ["u2netp"]
+DEFAULT_MODEL_CANDIDATES = ["u2netp"]
 _SESSION_CACHE: dict[str, object] = {}
+_SESSION_PROVIDER_CACHE: dict[str, list[str]] = {}
+_SESSION_ERRORS: dict[str, list[str]] = {}
+_SESSION_LOCK = threading.Lock()
 
 
 @dataclass
@@ -38,15 +41,21 @@ class BorderModel:
 class AutoParams:
     main_model: str
     aux_model: str | None
+    rescue_model: str | None
     feather_strength: float
     alpha_cutoff: int
     min_blob_percent: float
     temporal_smooth: float
+    temporal_flow_strength: float
+    edge_refine_strength: float
     grabcut_iterations: int
     keep_largest_component: bool
     border_distance_multiplier: float
     border_alpha_guard: int
     protect_dilate_px: int
+    frame_recheck_enabled: bool
+    frame_recheck_edge_threshold: float
+    frame_recheck_disagreement_threshold: float
 
 
 @dataclass
@@ -60,14 +69,107 @@ class RenderStats:
     suspect_frames: list[int]
 
 
+def _available_ort_providers() -> list[str]:
+    try:
+        providers = list(ort.get_available_providers())
+    except Exception:  # noqa: BLE001
+        providers = []
+    if "CPUExecutionProvider" not in providers:
+        providers.append("CPUExecutionProvider")
+    return providers
+
+
+def _provider_attempts() -> list[list[str]]:
+    available = _available_ort_providers()
+    preferred = [provider for provider in settings.ort_provider_order if provider in available]
+    attempts: list[list[str]] = []
+    if preferred:
+        attempts.append(preferred)
+    elif "CPUExecutionProvider" in available:
+        attempts.append(["CPUExecutionProvider"])
+
+    if settings.engine_ort_allow_cpu_fallback and "CPUExecutionProvider" in available:
+        if not attempts or attempts[-1] != ["CPUExecutionProvider"]:
+            attempts.append(["CPUExecutionProvider"])
+
+    if not attempts:
+        attempts.append(["CPUExecutionProvider"])
+
+    deduped: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for attempt in attempts:
+        key = tuple(attempt)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(attempt)
+    return deduped
+
+
 def _session_for(model_name: str):
-    if model_name not in _SESSION_CACHE:
-        _SESSION_CACHE[model_name] = new_session(model_name)
-    return _SESSION_CACHE[model_name]
+    with _SESSION_LOCK:
+        cached = _SESSION_CACHE.get(model_name)
+        if cached is not None:
+            return cached
+
+    attempts = _provider_attempts()
+    errors: list[str] = []
+    for providers in attempts:
+        try:
+            session = new_session(model_name, providers=providers)
+            used_providers = providers
+            inner_session = getattr(session, "inner_session", None)
+            if inner_session is not None and hasattr(inner_session, "get_providers"):
+                used_providers = list(inner_session.get_providers())
+            with _SESSION_LOCK:
+                _SESSION_CACHE[model_name] = session
+                _SESSION_PROVIDER_CACHE[model_name] = used_providers
+                _SESSION_ERRORS.pop(model_name, None)
+            return session
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{providers}: {type(exc).__name__}: {exc}")
+
+    with _SESSION_LOCK:
+        _SESSION_ERRORS[model_name] = errors[-4:]
+    raise RuntimeError(
+        f"Could not initialize model '{model_name}' with providers {attempts}. "
+        f"Last error: {errors[-1] if errors else 'unknown'}"
+    )
 
 
 def clear_model_cache():
-    _SESSION_CACHE.clear()
+    with _SESSION_LOCK:
+        _SESSION_CACHE.clear()
+        _SESSION_PROVIDER_CACHE.clear()
+        _SESSION_ERRORS.clear()
+
+
+def ort_runtime_info() -> dict:
+    try:
+        device = str(ort.get_device())
+    except Exception:  # noqa: BLE001
+        device = "unknown"
+    with _SESSION_LOCK:
+        session_providers = {key: list(value) for key, value in _SESSION_PROVIDER_CACHE.items()}
+        session_errors = {key: list(value) for key, value in _SESSION_ERRORS.items()}
+    return {
+        "runtime_flavor": settings.engine_ort_runtime_flavor,
+        "ort_version": getattr(ort, "__version__", "unknown"),
+        "ort_device": device,
+        "available_providers": _available_ort_providers(),
+        "preferred_provider_order": settings.ort_provider_order,
+        "provider_attempts": _provider_attempts(),
+        "allow_cpu_fallback": bool(settings.engine_ort_allow_cpu_fallback),
+        "loaded_models": session_providers,
+        "session_errors": session_errors,
+    }
+
+
+def _model_candidates_for_quality(quality: str) -> list[str]:
+    configured = settings.model_candidates(quality)
+    if configured:
+        return configured
+    return DEFAULT_MODEL_CANDIDATES
 
 
 def _video_meta(video_path: Path) -> VideoMeta:
@@ -343,7 +445,14 @@ def _mean_on_mask(img: np.ndarray, mask: np.ndarray) -> float:
     return float(img[valid].mean())
 
 
-def _choose_models_and_cache(sample_frames: list[np.ndarray]) -> tuple[str, str, dict[str, list[np.ndarray]]]:
+def _choose_models_and_cache(
+    sample_frames: list[np.ndarray],
+    quality: str,
+) -> tuple[str, str | None, str | None, dict[str, list[np.ndarray]]]:
+    candidates = _model_candidates_for_quality(quality)
+    if not candidates:
+        candidates = DEFAULT_MODEL_CANDIDATES
+
     cache: dict[str, list[np.ndarray]] = {}
     model_scores: dict[str, float] = {}
 
@@ -357,7 +466,7 @@ def _choose_models_and_cache(sample_frames: list[np.ndarray]) -> tuple[str, str,
     center = np.zeros((h, w), dtype=np.uint8)
     center[int(h * 0.25) : int(h * 0.75), int(w * 0.25) : int(w * 0.75)] = 1
 
-    for model in MODEL_CANDIDATES:
+    for model in candidates:
         session = _session_for(model)
         alphas = [_infer_alpha(session, frame, max_side=960) for frame in sample_frames]
         cache[model] = alphas
@@ -365,13 +474,30 @@ def _choose_models_and_cache(sample_frames: list[np.ndarray]) -> tuple[str, str,
         center_scores = np.array([_mean_on_mask(a, center) for a in alphas], dtype=np.float32)
         edge_scores = np.array([_mean_on_mask(a, edge) for a in alphas], dtype=np.float32)
         area_scores = np.array([float((a > 140).mean()) for a in alphas], dtype=np.float32)
-        score = float(center_scores.mean() - 1.7 * edge_scores.mean() - 45.0 * area_scores.mean())
+        stability_penalty = float(edge_scores.std() * 0.45)
+        score = float(center_scores.mean() - 1.65 * edge_scores.mean() - 42.0 * area_scores.mean() - stability_penalty)
         model_scores[model] = score
 
     sorted_models = sorted(model_scores.items(), key=lambda x: x[1], reverse=True)
     main_model = sorted_models[0][0]
-    aux_model = sorted_models[1][0] if len(sorted_models) > 1 else sorted_models[0][0]
-    return main_model, aux_model, cache
+    aux_model = sorted_models[1][0] if len(sorted_models) > 1 else None
+    rescue_model = sorted_models[2][0] if len(sorted_models) > 2 else aux_model
+    if aux_model == main_model:
+        aux_model = None
+    if rescue_model == main_model:
+        rescue_model = None
+    return main_model, aux_model, rescue_model, cache
+
+
+def prewarm_models(quality: str | None = None) -> list[str]:
+    qualities: list[str] = [quality] if quality else ["balanced", "ultra"]
+    loaded: list[str] = []
+    for q in qualities:
+        for model in _model_candidates_for_quality(q):
+            _session_for(model)
+            if model not in loaded:
+                loaded.append(model)
+    return loaded
 
 
 def _auto_params(
@@ -380,7 +506,8 @@ def _auto_params(
     border_model: BorderModel,
     alpha_cache: list[np.ndarray],
     main_model: str,
-    aux_model: str,
+    aux_model: str | None,
+    rescue_model: str | None,
 ) -> AutoParams:
     h, w = sample_frames[0].shape[:2]
     center = np.zeros((h, w), dtype=np.uint8)
@@ -417,20 +544,26 @@ def _auto_params(
     alpha_cutoff = int(np.clip(base_cutoff + leak_boost + center_relief, 145, 220))
     dist_mult = float(np.clip(dist_mult + leak * 0.55, 0.9, 1.5))
     min_blob = float(np.clip(min_blob + leak * 0.35, 0.05, 0.60))
-    use_aux = (quality == "ultra") or (leak > 0.08)
+    use_aux = ((quality == "ultra") or (leak > 0.08)) and aux_model is not None
 
     return AutoParams(
         main_model=main_model,
         aux_model=aux_model if use_aux else None,
+        rescue_model=rescue_model if quality == "ultra" else None,
         feather_strength=feather,
         alpha_cutoff=alpha_cutoff,
         min_blob_percent=min_blob,
         temporal_smooth=temporal,
+        temporal_flow_strength=float(np.clip(settings.engine_temporal_flow_strength, 0.0, 0.55)),
+        edge_refine_strength=float(np.clip(settings.engine_edge_refine_strength, 0.0, 1.0)),
         grabcut_iterations=grabcut,
         keep_largest_component=True,
         border_distance_multiplier=dist_mult,
         border_alpha_guard=242,
         protect_dilate_px=protect,
+        frame_recheck_enabled=bool(settings.engine_enable_frame_recheck),
+        frame_recheck_edge_threshold=float(max(2.0, settings.engine_recheck_edge_threshold)),
+        frame_recheck_disagreement_threshold=float(max(5.0, settings.engine_recheck_disagreement_threshold)),
     )
 
 
@@ -438,16 +571,106 @@ def _tighten_auto_params(params: AutoParams) -> AutoParams:
     return AutoParams(
         main_model=params.main_model,
         aux_model=params.aux_model,
+        rescue_model=params.rescue_model,
         feather_strength=float(min(2.0, params.feather_strength + 0.2)),
         alpha_cutoff=int(min(224, params.alpha_cutoff + 12)),
         min_blob_percent=float(min(0.85, params.min_blob_percent + 0.08)),
         temporal_smooth=float(min(0.48, params.temporal_smooth + 0.08)),
+        temporal_flow_strength=float(min(0.58, params.temporal_flow_strength + 0.05)),
+        edge_refine_strength=float(min(1.0, params.edge_refine_strength + 0.06)),
         grabcut_iterations=int(min(3, params.grabcut_iterations + 1)),
         keep_largest_component=True,
         border_distance_multiplier=float(min(1.48, params.border_distance_multiplier + 0.12)),
         border_alpha_guard=int(max(226, params.border_alpha_guard - 8)),
         protect_dilate_px=int(min(57, params.protect_dilate_px + 8)),
+        frame_recheck_enabled=params.frame_recheck_enabled,
+        frame_recheck_edge_threshold=max(2.0, params.frame_recheck_edge_threshold - 0.5),
+        frame_recheck_disagreement_threshold=max(5.0, params.frame_recheck_disagreement_threshold - 2.0),
     )
+
+
+def _fuse_alpha_maps(
+    main_alpha: np.ndarray,
+    aux_alpha: np.ndarray,
+    main_model: str,
+    aux_model: str,
+) -> np.ndarray:
+    # Human-specific model complements general models better with this strategy.
+    if "human_seg" in main_model or "human_seg" in aux_model:
+        return _fuse_human_general(main_alpha, aux_alpha, main_model=main_model, aux_model=aux_model)
+
+    union = np.maximum(main_alpha, aux_alpha)
+    core = np.where(union > 176, 255, 0).astype(np.uint8)
+    core = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45, 45)), iterations=1)
+    conservative = np.minimum(main_alpha, aux_alpha)
+    permissive = np.maximum(main_alpha, aux_alpha)
+    return np.where(core > 0, permissive, conservative).astype(np.uint8)
+
+
+def _edge_aware_refine(alpha: np.ndarray, frame_bgr: np.ndarray, strength: float) -> np.ndarray:
+    if strength <= 0.0:
+        return alpha
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, threshold1=50, threshold2=130)
+    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+    transition = np.where((alpha > 0) & (alpha < 255), 255, 0).astype(np.uint8)
+    roi = np.where((edges > 0) | (transition > 0), 255, 0).astype(np.uint8)
+    if np.count_nonzero(roi) == 0:
+        return alpha
+
+    diameter = 7 if strength < 0.75 else 9
+    sigma_color = float(45.0 + (35.0 * strength))
+    sigma_space = float(6.0 + (4.0 * strength))
+    smooth = cv2.bilateralFilter(alpha, diameter, sigma_color, sigma_space)
+    out = alpha.copy()
+    out[roi > 0] = smooth[roi > 0]
+    return out.astype(np.uint8)
+
+
+def _flow_guided_temporal_blend(
+    alpha: np.ndarray,
+    prev_alpha: np.ndarray | None,
+    frame_bgr: np.ndarray,
+    prev_gray: np.ndarray | None,
+    strength: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if prev_alpha is None or prev_gray is None or strength <= 0.0:
+        return alpha, gray
+
+    # Flow from current -> previous allows remapping prev alpha to current frame coordinates.
+    flow = cv2.calcOpticalFlowFarneback(
+        gray,
+        prev_gray,
+        None,
+        0.5,
+        3,
+        15,
+        3,
+        5,
+        1.2,
+        0,
+    )
+    h, w = gray.shape[:2]
+    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    map_x = grid_x + flow[:, :, 0]
+    map_y = grid_y + flow[:, :, 1]
+    warped_prev = cv2.remap(prev_alpha, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    motion_mag = float(np.mean(np.linalg.norm(flow, axis=2)))
+    motion_gate = float(np.clip(1.0 - (motion_mag / 5.8), 0.0, 1.0))
+    blend_w = float(np.clip(strength * motion_gate, 0.0, 0.65))
+    if blend_w <= 0.0:
+        return alpha, gray
+
+    blended = cv2.addWeighted(
+        alpha.astype(np.float32),
+        1.0 - blend_w,
+        warped_prev.astype(np.float32),
+        blend_w,
+        0.0,
+    )
+    return np.clip(blended, 0, 255).astype(np.uint8), gray
 
 
 def _quality_stats(edge_values: np.ndarray, area_values: np.ndarray, comp_values: np.ndarray) -> RenderStats:
@@ -604,8 +827,9 @@ def _watermark_layout(width: int, height: int, text: str) -> tuple[int, int, int
     return x, y, icon_size, gap, text_w, text_h, baseline, thickness
 
 
-def _apply_watermark_bgr(frame_bgr: np.ndarray) -> np.ndarray:
-    if not settings.engine_watermark_enabled:
+def _apply_watermark_bgr(frame_bgr: np.ndarray, watermark_enabled: bool | None = None) -> np.ndarray:
+    enabled = settings.engine_watermark_enabled if watermark_enabled is None else bool(watermark_enabled)
+    if not enabled:
         return frame_bgr
     text = (settings.engine_watermark_text or "").strip()
     if not text:
@@ -649,8 +873,9 @@ def _alpha_compose_rgba(base: np.ndarray, overlay: np.ndarray) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _apply_watermark_rgba(frame_rgba: np.ndarray) -> np.ndarray:
-    if not settings.engine_watermark_enabled:
+def _apply_watermark_rgba(frame_rgba: np.ndarray, watermark_enabled: bool | None = None) -> np.ndarray:
+    enabled = settings.engine_watermark_enabled if watermark_enabled is None else bool(watermark_enabled)
+    if not enabled:
         return frame_rgba
     text = (settings.engine_watermark_text or "").strip()
     if not text:
@@ -692,8 +917,10 @@ def _render_with_params(
     erase_mask: np.ndarray | None,
     keep_mask: np.ndarray | None,
     bg_rgb: tuple[int, int, int] | None,
+    watermark_enabled: bool | None,
     main_max_side: int,
     aux_max_side: int,
+    rescue_max_side: int,
 ) -> RenderStats:
     cmd = (
         _ffmpeg_cmd_transparent(ffmpeg_bin, video_path, output_video, meta.width, meta.height, meta.fps)
@@ -702,6 +929,7 @@ def _render_with_params(
     )
     session_main = _session_for(params.main_model)
     session_aux = _session_for(params.aux_model) if params.aux_model else None
+    session_rescue = _session_for(params.rescue_model) if params.rescue_model else None
     min_area_px = int((meta.width * meta.height) * (params.min_blob_percent / 100.0))
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -709,6 +937,7 @@ def _render_with_params(
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     prev_alpha = None
     prev_lock = None
+    prev_gray = None
     h, w = meta.height, meta.width
     edge_band = max(8, int(min(h, w) * 0.08))
     edge_mask = np.zeros((h, w), dtype=np.uint8)
@@ -725,11 +954,14 @@ def _render_with_params(
             if not ok:
                 break
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            alpha = _infer_alpha(session_main, frame_rgb, max_side=main_max_side)
+            alpha_main = _infer_alpha(session_main, frame_rgb, max_side=main_max_side)
+            alpha = alpha_main
+            aux_disagreement = 0.0
             if session_aux is not None:
                 aux_alpha = _infer_alpha(session_aux, frame_rgb, max_side=aux_max_side)
-                alpha = _fuse_human_general(
-                    alpha,
+                aux_disagreement = float(np.mean(np.abs(alpha_main.astype(np.int16) - aux_alpha.astype(np.int16))))
+                alpha = _fuse_alpha_maps(
+                    alpha_main,
                     aux_alpha,
                     main_model=params.main_model,
                     aux_model=params.aux_model or params.main_model,
@@ -757,6 +989,13 @@ def _render_with_params(
             alpha[(keep_zone == 0) & (alpha < 248)] = 0
             alpha = _grabcut_refine(frame_bgr, alpha, iterations=params.grabcut_iterations)
             alpha = _apply_manual_masks(alpha, erase_mask=erase_mask, keep_mask=keep_mask)
+            alpha, frame_gray = _flow_guided_temporal_blend(
+                alpha,
+                prev_alpha=prev_alpha,
+                frame_bgr=frame_bgr,
+                prev_gray=prev_gray,
+                strength=params.temporal_flow_strength,
+            )
             alpha = _refine_alpha(
                 alpha,
                 feather_strength=params.feather_strength,
@@ -766,6 +1005,7 @@ def _render_with_params(
                 temporal_smooth=params.temporal_smooth,
                 prev_alpha=prev_alpha,
             )
+            alpha = _edge_aware_refine(alpha, frame_bgr=frame_bgr, strength=params.edge_refine_strength)
 
             if prev_alpha is not None:
                 cur_edge = float(alpha[edge_mask > 0].mean())
@@ -778,6 +1018,37 @@ def _render_with_params(
                     )
                     alpha[(stable_zone == 0) & (alpha < 250)] = 0
 
+            cur_edge = float(alpha[edge_mask > 0].mean())
+            if (
+                session_rescue is not None
+                and params.frame_recheck_enabled
+                and (
+                    cur_edge > params.frame_recheck_edge_threshold
+                    or aux_disagreement > params.frame_recheck_disagreement_threshold
+                )
+            ):
+                rescue_alpha = _infer_alpha(session_rescue, frame_rgb, max_side=rescue_max_side)
+                rescue_fused = _fuse_alpha_maps(
+                    alpha,
+                    rescue_alpha,
+                    main_model=params.main_model,
+                    aux_model=params.rescue_model or params.main_model,
+                )
+                rescue_fused = _apply_manual_masks(rescue_fused, erase_mask=erase_mask, keep_mask=keep_mask)
+                rescue_fused = _refine_alpha(
+                    rescue_fused,
+                    feather_strength=params.feather_strength,
+                    alpha_cutoff=params.alpha_cutoff,
+                    min_area_px=min_area_px,
+                    keep_largest=params.keep_largest_component,
+                    temporal_smooth=0.0,
+                    prev_alpha=None,
+                )
+                rescue_fused = _edge_aware_refine(rescue_fused, frame_bgr=frame_bgr, strength=params.edge_refine_strength)
+                rescue_edge = float(rescue_fused[edge_mask > 0].mean())
+                if rescue_edge + 0.35 < cur_edge:
+                    alpha = rescue_fused
+
             fg = (alpha > 128).astype(np.uint8)
             edge_values.append(float(alpha[edge_mask > 0].mean()))
             area_values.append(float(fg.mean()))
@@ -786,20 +1057,21 @@ def _render_with_params(
 
             if bg_rgb is None:
                 rgba = np.dstack([frame_rgb, alpha]).astype(np.uint8)
-                rgba = _apply_watermark_rgba(rgba)
+                rgba = _apply_watermark_rgba(rgba, watermark_enabled=watermark_enabled)
                 payload = rgba.tobytes()
             else:
                 alpha_f = (alpha.astype(np.float32) / 255.0)[:, :, None]
                 solid = np.full(frame_rgb.shape, (bg_rgb[0], bg_rgb[1], bg_rgb[2]), dtype=np.uint8)
                 comp_rgb = (frame_rgb.astype(np.float32) * alpha_f + solid.astype(np.float32) * (1.0 - alpha_f)).astype(np.uint8)
                 comp_bgr = cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2BGR)
-                comp_bgr = _apply_watermark_bgr(comp_bgr)
+                comp_bgr = _apply_watermark_bgr(comp_bgr, watermark_enabled=watermark_enabled)
                 payload = comp_bgr.tobytes()
             if proc.stdin:
                 proc.stdin.write(payload)
 
             prev_alpha = alpha
             prev_lock = np.where(alpha > 120, 255, 0).astype(np.uint8)
+            prev_gray = frame_gray
     except Exception as exc:  # noqa: BLE001
         proc.kill()
         raise RuntimeError(f"Render failed: {exc}") from exc
@@ -833,7 +1105,7 @@ def _prepare_auto_pipeline(video_path: Path, quality: str):
     if not sample_frames:
         raise RuntimeError("No sample frames.")
     border_model = _build_border_model(sample_frames, border_ratio=0.08, k=4)
-    main_model, aux_model, cache = _choose_models_and_cache(sample_frames)
+    main_model, aux_model, rescue_model, cache = _choose_models_and_cache(sample_frames, quality=quality)
     params = _auto_params(
         quality=quality,
         sample_frames=sample_frames,
@@ -841,6 +1113,7 @@ def _prepare_auto_pipeline(video_path: Path, quality: str):
         alpha_cache=cache[main_model],
         main_model=main_model,
         aux_model=aux_model,
+        rescue_model=rescue_model,
     )
     return meta, border_model, params
 
@@ -852,6 +1125,7 @@ def process_video(
     erase_mask: np.ndarray | None = None,
     keep_mask: np.ndarray | None = None,
     bg_rgb: tuple[int, int, int] | None = None,
+    watermark_enabled: bool | None = None,
 ) -> dict:
     ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
     if not Path(ffmpeg_bin).exists():
@@ -860,7 +1134,8 @@ def process_video(
     meta, border_model, params = _prepare_auto_pipeline(video_path, quality=quality)
     params_list = [params]
     if quality == "ultra":
-        for _ in range(4):
+        extra_passes = max(0, int(settings.engine_ultra_max_passes) - 1)
+        for _ in range(extra_passes):
             params_list.append(_tighten_auto_params(params_list[-1]))
 
     output_dir = output_path.parent
@@ -872,7 +1147,16 @@ def process_video(
 
     suffix = ".webm" if bg_rgb is None else ".mp4"
     for idx, pass_params in enumerate(params_list, start=1):
-        if best_stats is not None and len(best_stats.suspect_frames) == 0:
+        if (
+            best_stats is not None
+            and (
+                len(best_stats.suspect_frames) == 0
+                or (
+                    len(best_stats.suspect_frames) <= 1
+                    and best_stats.edge_leak_mean < 4.8
+                )
+            )
+        ):
             break
         pass_video = output_dir / f"{output_path.stem}_pass{idx}{suffix}"
         pass_stats = _render_with_params(
@@ -885,8 +1169,10 @@ def process_video(
             erase_mask=erase_mask,
             keep_mask=keep_mask,
             bg_rgb=bg_rgb,
+            watermark_enabled=watermark_enabled,
             main_max_side=_inference_side_limit(quality, "video"),
             aux_max_side=960,
+            rescue_max_side=960,
         )
         passes_run += 1
         if best_stats is None:
@@ -919,7 +1205,7 @@ def process_video(
 
 def _image_auto_params(frame_rgb: np.ndarray, quality: str):
     border_model = _build_border_model([frame_rgb], border_ratio=0.08, k=4)
-    main_model, aux_model, cache = _choose_models_and_cache([frame_rgb])
+    main_model, aux_model, rescue_model, cache = _choose_models_and_cache([frame_rgb], quality=quality)
     params = _auto_params(
         quality=quality,
         sample_frames=[frame_rgb],
@@ -927,6 +1213,7 @@ def _image_auto_params(frame_rgb: np.ndarray, quality: str):
         alpha_cache=cache[main_model],
         main_model=main_model,
         aux_model=aux_model,
+        rescue_model=rescue_model,
     )
     return border_model, params
 
@@ -938,6 +1225,7 @@ def process_image(
     erase_mask: np.ndarray | None = None,
     keep_mask: np.ndarray | None = None,
     bg_rgb: tuple[int, int, int] | None = None,
+    watermark_enabled: bool | None = None,
 ) -> dict:
     frame_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if frame_bgr is None:
@@ -947,11 +1235,14 @@ def process_image(
 
     border_model, params = _image_auto_params(frame_rgb, quality=quality)
     session_main = _session_for(params.main_model)
-    alpha = _infer_alpha(session_main, frame_rgb, max_side=_inference_side_limit(quality, "image"))
+    alpha_main = _infer_alpha(session_main, frame_rgb, max_side=_inference_side_limit(quality, "image"))
+    alpha = alpha_main
+    aux_disagreement = 0.0
     if params.aux_model:
         session_aux = _session_for(params.aux_model)
         aux_alpha = _infer_alpha(session_aux, frame_rgb, max_side=1280)
-        alpha = _fuse_human_general(alpha, aux_alpha, params.main_model, params.aux_model)
+        aux_disagreement = float(np.mean(np.abs(alpha_main.astype(np.int16) - aux_alpha.astype(np.int16))))
+        alpha = _fuse_alpha_maps(alpha_main, aux_alpha, params.main_model, params.aux_model)
 
     bg_mask = _border_connected_bg_mask(frame_rgb, border_model=border_model, dist_multiplier=params.border_distance_multiplier)
     sure_fg = (alpha >= 225).astype(np.uint8) * 255
@@ -973,11 +1264,44 @@ def process_image(
         temporal_smooth=0.0,
         prev_alpha=None,
     )
+    alpha = _edge_aware_refine(alpha, frame_bgr=frame_bgr, strength=params.edge_refine_strength)
+
+    edge_band = max(8, int(min(h, w) * 0.08))
+    edge_mask = np.zeros((h, w), dtype=np.uint8)
+    edge_mask[:edge_band, :] = 1
+    edge_mask[-edge_band:, :] = 1
+    edge_mask[:, :edge_band] = 1
+    edge_mask[:, -edge_band:] = 1
+    leak_before_rescue = float(alpha[edge_mask > 0].mean())
+    if (
+        params.frame_recheck_enabled
+        and params.rescue_model
+        and (
+            leak_before_rescue > params.frame_recheck_edge_threshold
+            or aux_disagreement > params.frame_recheck_disagreement_threshold
+        )
+    ):
+        rescue_alpha = _infer_alpha(_session_for(params.rescue_model), frame_rgb, max_side=1200)
+        candidate = _fuse_alpha_maps(alpha, rescue_alpha, params.main_model, params.rescue_model)
+        candidate = _apply_manual_masks(candidate, erase_mask=erase_mask, keep_mask=keep_mask)
+        candidate = _refine_alpha(
+            candidate,
+            feather_strength=params.feather_strength,
+            alpha_cutoff=params.alpha_cutoff,
+            min_area_px=min_area_px,
+            keep_largest=params.keep_largest_component,
+            temporal_smooth=0.0,
+            prev_alpha=None,
+        )
+        candidate = _edge_aware_refine(candidate, frame_bgr=frame_bgr, strength=params.edge_refine_strength)
+        candidate_leak = float(candidate[edge_mask > 0].mean())
+        if candidate_leak + 0.35 < leak_before_rescue:
+            alpha = candidate
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if bg_rgb is None:
         rgba = np.dstack([frame_rgb, alpha]).astype(np.uint8)
-        rgba = _apply_watermark_rgba(rgba)
+        rgba = _apply_watermark_rgba(rgba, watermark_enabled=watermark_enabled)
         out_bgra = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
         cv2.imwrite(str(output_path), out_bgra)
         output_kind = "image/png"
@@ -986,16 +1310,10 @@ def process_image(
         solid = np.full(frame_rgb.shape, (bg_rgb[0], bg_rgb[1], bg_rgb[2]), dtype=np.uint8)
         comp_rgb = (frame_rgb.astype(np.float32) * alpha_f + solid.astype(np.float32) * (1.0 - alpha_f)).astype(np.uint8)
         comp_bgr = cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2BGR)
-        comp_bgr = _apply_watermark_bgr(comp_bgr)
+        comp_bgr = _apply_watermark_bgr(comp_bgr, watermark_enabled=watermark_enabled)
         cv2.imwrite(str(output_path), comp_bgr)
         output_kind = "image/png"
 
-    edge_band = max(8, int(min(h, w) * 0.08))
-    edge_mask = np.zeros((h, w), dtype=np.uint8)
-    edge_mask[:edge_band, :] = 1
-    edge_mask[-edge_band:, :] = 1
-    edge_mask[:, :edge_band] = 1
-    edge_mask[:, -edge_band:] = 1
     leak = float(alpha[edge_mask > 0].mean())
     return {
         "output_path": str(output_path),

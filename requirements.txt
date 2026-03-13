@@ -3,7 +3,6 @@ uvicorn[standard]==0.35.0
 numpy==2.2.6
 opencv-python-headless==4.12.0.88
 rembg==2.0.67
-onnxruntime==1.22.1
 imageio-ffmpeg==0.6.0
 python-multipart==0.0.22
 pydantic-settings==2.10.1
