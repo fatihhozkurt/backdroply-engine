@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import base64
+import logging
+import os
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +24,9 @@ _SESSION_CACHE: dict[str, object] = {}
 _SESSION_PROVIDER_CACHE: dict[str, list[str]] = {}
 _SESSION_ERRORS: dict[str, list[str]] = {}
 _SESSION_LOCK = threading.Lock()
+_RUNTIME_BOOT_MODE = "uninitialized"
+_RUNTIME_BOOT_REASON = ""
+logger = logging.getLogger("backdroply.engine.processing")
 
 
 @dataclass
@@ -77,6 +84,77 @@ def _available_ort_providers() -> list[str]:
     if "CPUExecutionProvider" not in providers:
         providers.append("CPUExecutionProvider")
     return providers
+
+
+def _set_runtime_boot_status(mode: str, reason: str = ""):
+    global _RUNTIME_BOOT_MODE, _RUNTIME_BOOT_REASON
+    _RUNTIME_BOOT_MODE = mode
+    _RUNTIME_BOOT_REASON = reason[:400]
+
+
+def _probe_cuda_in_subprocess(timeout_sec: int) -> tuple[bool, str]:
+    script = """
+import sys
+from rembg import new_session
+
+try:
+    session = new_session("u2netp", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    inner = getattr(session, "inner_session", None)
+    providers = []
+    if inner is not None and hasattr(inner, "get_providers"):
+        providers = list(inner.get_providers())
+    if "CUDAExecutionProvider" in providers:
+        sys.exit(0)
+    sys.exit(3)
+except Exception:
+    sys.exit(2)
+"""
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            env=os.environ.copy(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=max(3, timeout_sec),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "cuda probe timeout"
+    if completed.returncode == 0:
+        return True, "cuda provider usable"
+    stderr_tail = (completed.stderr or b"").decode("utf-8", errors="ignore")[-300:].strip()
+    reason = stderr_tail or f"cuda probe exit code {completed.returncode}"
+    return False, reason
+
+
+def ensure_runtime_provider_ready() -> dict[str, str]:
+    available = _available_ort_providers()
+    preferred = settings.ort_provider_order
+
+    if "CUDAExecutionProvider" not in preferred:
+        _set_runtime_boot_status("cpu-configured", "cuda not preferred by config")
+        return {"mode": _RUNTIME_BOOT_MODE, "reason": _RUNTIME_BOOT_REASON}
+
+    if "CUDAExecutionProvider" not in available:
+        if settings.engine_ort_allow_cpu_fallback:
+            force_cpu_only_mode()
+            _set_runtime_boot_status("cpu-fallback", "cuda provider not available")
+            return {"mode": _RUNTIME_BOOT_MODE, "reason": _RUNTIME_BOOT_REASON}
+        _set_runtime_boot_status("gpu-unavailable", "cuda provider not available and fallback disabled")
+        return {"mode": _RUNTIME_BOOT_MODE, "reason": _RUNTIME_BOOT_REASON}
+
+    ok, reason = _probe_cuda_in_subprocess(timeout_sec=int(settings.engine_ort_probe_timeout_sec))
+    if ok:
+        _set_runtime_boot_status("gpu", reason)
+        return {"mode": _RUNTIME_BOOT_MODE, "reason": _RUNTIME_BOOT_REASON}
+
+    if settings.engine_ort_allow_cpu_fallback:
+        force_cpu_only_mode()
+        _set_runtime_boot_status("cpu-fallback", f"cuda probe failed: {reason}")
+        return {"mode": _RUNTIME_BOOT_MODE, "reason": _RUNTIME_BOOT_REASON}
+
+    _set_runtime_boot_status("gpu-probe-failed", reason)
+    return {"mode": _RUNTIME_BOOT_MODE, "reason": _RUNTIME_BOOT_REASON}
 
 
 def _provider_attempts() -> list[list[str]]:
@@ -144,6 +222,14 @@ def clear_model_cache():
         _SESSION_ERRORS.clear()
 
 
+def force_cpu_only_mode():
+    """Switch runtime provider preference to CPU and drop loaded sessions."""
+    settings.engine_ort_providers = "CPUExecutionProvider"
+    settings.engine_ort_runtime_flavor = "cpu"
+    clear_model_cache()
+    _set_runtime_boot_status("cpu-fallback", "forced to cpu-only mode")
+
+
 def ort_runtime_info() -> dict:
     try:
         device = str(ort.get_device())
@@ -160,9 +246,22 @@ def ort_runtime_info() -> dict:
         "preferred_provider_order": settings.ort_provider_order,
         "provider_attempts": _provider_attempts(),
         "allow_cpu_fallback": bool(settings.engine_ort_allow_cpu_fallback),
+        "boot_mode": _RUNTIME_BOOT_MODE,
+        "boot_reason": _RUNTIME_BOOT_REASON,
         "loaded_models": session_providers,
         "session_errors": session_errors,
     }
+
+
+def _runtime_is_cpu() -> bool:
+    flavor = settings.engine_ort_runtime_flavor.strip().lower()
+    if flavor == "cpu":
+        return True
+    with _SESSION_LOCK:
+        cached = list(_SESSION_PROVIDER_CACHE.values())
+    if cached:
+        return not any("CUDAExecutionProvider" in providers for providers in cached)
+    return "CUDAExecutionProvider" not in _available_ort_providers()
 
 
 def _model_candidates_for_quality(quality: str) -> list[str]:
@@ -242,7 +341,12 @@ def _infer_alpha(
 def _inference_side_limit(quality: str, media_type: str) -> int:
     q = (quality or "").strip().lower()
     if media_type == "video":
-        return 1280 if q == "ultra" else 960
+        cpu_mode = _runtime_is_cpu()
+        if q == "ultra":
+            configured = settings.engine_video_cpu_ultra_max_side if cpu_mode else settings.engine_video_max_side_ultra
+            return max(512, int(configured))
+        configured = settings.engine_video_cpu_balanced_max_side if cpu_mode else settings.engine_video_max_side_balanced
+        return max(448, int(configured))
     return 1400 if q == "ultra" else 1100
 
 
@@ -290,14 +394,24 @@ def _border_connected_bg_mask(
     border_model: BorderModel,
     dist_multiplier: float,
 ) -> np.ndarray:
-    lab = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    h, w = frame_rgb.shape[:2]
+    bgmask_max_side = int(max(256, settings.engine_video_bgmask_max_side))
+    scale = 1.0
+    proc_rgb = frame_rgb
+    if max(h, w) > bgmask_max_side:
+        scale = bgmask_max_side / float(max(h, w))
+        nw = max(64, int(round(w * scale)))
+        nh = max(64, int(round(h * scale)))
+        proc_rgb = cv2.resize(frame_rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    lab = cv2.cvtColor(proc_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     centers = border_model.centers_lab
     radii = border_model.radii * max(0.6, dist_multiplier)
 
     diff = lab[:, :, None, :] - centers[None, None, :, :]
-    dist = np.linalg.norm(diff, axis=3)
-    norm_score = np.min(dist / (radii[None, None, :] + 1e-6), axis=2)
-    bg_like = (norm_score < 1.0).astype(np.uint8)
+    dist2 = np.sum(diff * diff, axis=3)
+    norm_score2 = np.min(dist2 / ((radii[None, None, :] ** 2) + 1e-6), axis=2)
+    bg_like = (norm_score2 < 1.0).astype(np.uint8)
     bg_like = cv2.morphologyEx(
         bg_like,
         cv2.MORPH_OPEN,
@@ -311,11 +425,17 @@ def _border_connected_bg_mask(
     border_labels = set(np.unique(np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])))
     border_labels.discard(0)
     if not border_labels:
-        return np.zeros_like(bg_like, dtype=np.uint8)
+        out_small = np.zeros_like(bg_like, dtype=np.uint8)
+        if scale != 1.0:
+            return cv2.resize(out_small, (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+        return out_small
     lut = np.zeros((num,), dtype=np.uint8)
     for lb in border_labels:
         lut[int(lb)] = 1
-    return lut[labels].astype(np.uint8)
+    out_small = lut[labels].astype(np.uint8)
+    if scale != 1.0:
+        return cv2.resize(out_small, (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+    return out_small
 
 
 def _largest_component(mask: np.ndarray) -> np.ndarray:
@@ -368,6 +488,105 @@ def _component_clean(alpha: np.ndarray, min_area_px: int, keep_largest: bool) ->
                 keep[idx] = 1
     cleaned = keep[labels]
     return np.where(cleaned > 0, alpha, 0).astype(np.uint8)
+
+
+def _recover_near_subject_components(
+    alpha: np.ndarray,
+    reference_alpha: np.ndarray,
+    proximity_px: int,
+    min_component_area: int,
+) -> np.ndarray:
+    if alpha.shape != reference_alpha.shape:
+        return alpha
+
+    subject_seed = np.where(alpha >= 120, 255, 0).astype(np.uint8)
+    main_subject = _largest_component(subject_seed)
+    if np.count_nonzero(main_subject) == 0:
+        return alpha
+
+    k = int(max(9, proximity_px))
+    if k % 2 == 0:
+        k += 1
+    near_zone = cv2.dilate(main_subject, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), iterations=1)
+    candidate_mask = np.where(reference_alpha >= 104, 255, 0).astype(np.uint8)
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(candidate_mask, connectivity=8)
+    if num <= 1:
+        return alpha
+    keep = np.zeros((num,), dtype=np.uint8)
+    keep[0] = 0
+    for idx in range(1, num):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area < min_component_area:
+            continue
+        comp = labels == idx
+        if np.any(near_zone[comp] > 0):
+            keep[idx] = 1
+    recovered = keep[labels] > 0
+    if not np.any(recovered):
+        return alpha
+
+    out = alpha.copy()
+    out[recovered] = np.maximum(out[recovered], reference_alpha[recovered])
+    return out
+
+
+def _suppress_border_components(
+    alpha: np.ndarray,
+    protect_zone: np.ndarray | None,
+    alpha_min: int = 56,
+) -> np.ndarray:
+    mask = np.where(alpha >= alpha_min, 255, 0).astype(np.uint8)
+    num, labels, _, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num <= 1:
+        return alpha
+
+    border_labels = set(
+        np.unique(np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])).tolist()
+    )
+    border_labels.discard(0)
+    if not border_labels:
+        return alpha
+
+    protected_labels: set[int] = set()
+    if protect_zone is not None and np.any(protect_zone > 0):
+        protected_labels = set(np.unique(labels[protect_zone > 0]).tolist())
+    drop_labels = border_labels.difference(protected_labels)
+    if not drop_labels:
+        return alpha
+
+    drop_mask = np.isin(labels, np.array(list(drop_labels), dtype=labels.dtype))
+    out = alpha.copy()
+    if protect_zone is not None:
+        out[drop_mask & (protect_zone == 0)] = 0
+    else:
+        out[drop_mask] = 0
+    return out
+
+
+def _strict_needed(alpha: np.ndarray, leak_zone: np.ndarray, threshold: int) -> bool:
+    if threshold <= 0:
+        return False
+    if np.any(leak_zone):
+        leak_mean = float(alpha[leak_zone].mean())
+        return leak_mean >= float(threshold)
+    edge_band = max(4, int(min(alpha.shape[:2]) * 0.04))
+    edge_mask = np.zeros(alpha.shape[:2], dtype=np.uint8)
+    edge_mask[:edge_band, :] = 1
+    edge_mask[-edge_band:, :] = 1
+    edge_mask[:, :edge_band] = 1
+    edge_mask[:, -edge_band:] = 1
+    return float(alpha[edge_mask > 0].mean()) >= float(threshold + 6)
+
+
+def _merge_strict_alpha(main_alpha: np.ndarray, strict_alpha: np.ndarray) -> np.ndarray:
+    main = main_alpha.astype(np.uint8)
+    strict = strict_alpha.astype(np.uint8)
+    core = np.where(main > 205, 255, 0).astype(np.uint8)
+    shell = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (37, 37)), iterations=1)
+    bg_clean = np.minimum(main, strict).astype(np.uint8)
+    fg_preserve = np.maximum(main, strict).astype(np.uint8)
+    return np.where(shell > 0, fg_preserve, bg_clean).astype(np.uint8)
 
 
 def _fuse_human_general(main_alpha: np.ndarray, aux_alpha: np.ndarray, main_model: str, aux_model: str) -> np.ndarray:
@@ -448,10 +667,26 @@ def _mean_on_mask(img: np.ndarray, mask: np.ndarray) -> float:
 def _choose_models_and_cache(
     sample_frames: list[np.ndarray],
     quality: str,
+    meta: VideoMeta | None = None,
 ) -> tuple[str, str | None, str | None, dict[str, list[np.ndarray]]]:
     candidates = _model_candidates_for_quality(quality)
     if not candidates:
         candidates = DEFAULT_MODEL_CANDIDATES
+
+    # CPU runtime on dense video can be memory-fragile with multi-model auto-selection.
+    # Force a single lightweight model to prevent native OOM kills.
+    if _runtime_is_cpu():
+        preferred_cpu_order = ["u2netp", "silueta", "u2net_human_seg", "u2net", "isnet-general-use"]
+        chosen = None
+        for name in preferred_cpu_order:
+            if name in candidates:
+                chosen = name
+                break
+        if chosen is None:
+            chosen = candidates[0]
+        session = _session_for(chosen)
+        alphas = [_infer_alpha(session, frame, max_side=960) for frame in sample_frames]
+        return chosen, None, None, {chosen: alphas}
 
     cache: dict[str, list[np.ndarray]] = {}
     model_scores: dict[str, float] = {}
@@ -476,6 +711,17 @@ def _choose_models_and_cache(
         area_scores = np.array([float((a > 140).mean()) for a in alphas], dtype=np.float32)
         stability_penalty = float(edge_scores.std() * 0.45)
         score = float(center_scores.mean() - 1.65 * edge_scores.mean() - 42.0 * area_scores.mean() - stability_penalty)
+        if meta is not None and (quality or "").strip().lower() == "ultra":
+            dense_video = (meta.fps >= 45.0) or (meta.frame_count >= 260)
+            if dense_video:
+                if model == "u2netp":
+                    score += 9.0
+                elif model == "silueta":
+                    score += 4.0
+                elif model in {"isnet-general-use", "u2net"}:
+                    score -= 34.0
+                elif model == "u2net_human_seg":
+                    score -= 18.0
         model_scores[model] = score
 
     sorted_models = sorted(model_scores.items(), key=lambda x: x[1], reverse=True)
@@ -524,9 +770,9 @@ def _auto_params(
     center_fg = float(np.mean(center_values))
     if quality == "ultra":
         base_cutoff = 182
-        feather = 1.35
-        temporal = 0.30
-        grabcut = 2
+        feather = 1.18
+        temporal = 0.26
+        grabcut = 1
         dist_mult = 1.12
         min_blob = 0.14
         protect = 39
@@ -627,6 +873,98 @@ def _edge_aware_refine(alpha: np.ndarray, frame_bgr: np.ndarray, strength: float
     return out.astype(np.uint8)
 
 
+def _soft_edge_matte(alpha: np.ndarray, strength: float) -> np.ndarray:
+    if strength <= 0.0:
+        return alpha
+    a = alpha.astype(np.uint8)
+    transition = np.where((a > 0) & (a < 255), 255, 0).astype(np.uint8)
+    hard_fg = np.where(a >= 128, 255, 0).astype(np.uint8)
+    hard_boundary = cv2.morphologyEx(
+        hard_fg,
+        cv2.MORPH_GRADIENT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    seed = np.where((transition > 0) | (hard_boundary > 0), 255, 0).astype(np.uint8)
+    if np.count_nonzero(seed) == 0:
+        return a
+
+    radius = int(np.clip(round(2 + 5 * strength), 2, 7))
+    k = radius * 2 + 1
+    band = cv2.dilate(seed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), iterations=1)
+
+    sigma = float(0.75 + 1.8 * strength)
+    smooth = cv2.GaussianBlur(a, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+    weight = cv2.GaussianBlur(
+        (band.astype(np.float32) / 255.0),
+        (0, 0),
+        sigmaX=max(0.7, sigma * 0.7),
+        sigmaY=max(0.7, sigma * 0.7),
+    )
+    mix = float(np.clip(0.42 + 0.38 * strength, 0.30, 0.82))
+    weight = np.clip(weight * mix, 0.0, 0.82)
+
+    out = a.astype(np.float32) * (1.0 - weight) + smooth.astype(np.float32) * weight
+    out[(band == 0) & (a <= 2)] = 0.0
+    out[(band == 0) & (a >= 253)] = 255.0
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _warp_previous_alpha(
+    prev_alpha: np.ndarray,
+    gray: np.ndarray,
+    prev_gray: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    # Flow from current -> previous allows remapping prev alpha to current frame coordinates.
+    h, w = gray.shape[:2]
+    flow_max_side = int(max(256, settings.engine_video_flow_max_side))
+    scale = 1.0
+    gray_flow = gray
+    prev_gray_flow = prev_gray
+    alpha_flow = prev_alpha
+    if max(h, w) > flow_max_side:
+        scale = flow_max_side / float(max(h, w))
+        nw = max(64, int(round(w * scale)))
+        nh = max(64, int(round(h * scale)))
+        gray_flow = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
+        prev_gray_flow = cv2.resize(prev_gray, (nw, nh), interpolation=cv2.INTER_AREA)
+        alpha_flow = cv2.resize(prev_alpha, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+    flow = cv2.calcOpticalFlowFarneback(
+        gray_flow,
+        prev_gray_flow,
+        None,
+        0.5,
+        3,
+        15,
+        3,
+        5,
+        1.2,
+        0,
+    )
+    fh, fw = gray_flow.shape[:2]
+    grid_x, grid_y = np.meshgrid(np.arange(fw, dtype=np.float32), np.arange(fh, dtype=np.float32))
+    map_x = grid_x + flow[:, :, 0]
+    map_y = grid_y + flow[:, :, 1]
+    warped_prev_flow = cv2.remap(alpha_flow, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    if scale != 1.0:
+        warped_prev = cv2.resize(warped_prev_flow, (w, h), interpolation=cv2.INTER_LINEAR)
+    else:
+        warped_prev = warped_prev_flow
+
+    # Background motion is often much larger; gate refresh decision on the previous foreground area.
+    fg_mask = alpha_flow > 96
+    if np.any(fg_mask):
+        motion_mag = float(np.mean(np.linalg.norm(flow[fg_mask], axis=1)))
+    else:
+        motion_mag = float(np.mean(np.linalg.norm(flow, axis=2)))
+
+    if scale != 1.0:
+        motion_mag = motion_mag / max(scale, 1e-6)
+    return warped_prev, motion_mag
+
+
 def _flow_guided_temporal_blend(
     alpha: np.ndarray,
     prev_alpha: np.ndarray | None,
@@ -638,26 +976,7 @@ def _flow_guided_temporal_blend(
     if prev_alpha is None or prev_gray is None or strength <= 0.0:
         return alpha, gray
 
-    # Flow from current -> previous allows remapping prev alpha to current frame coordinates.
-    flow = cv2.calcOpticalFlowFarneback(
-        gray,
-        prev_gray,
-        None,
-        0.5,
-        3,
-        15,
-        3,
-        5,
-        1.2,
-        0,
-    )
-    h, w = gray.shape[:2]
-    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    map_x = grid_x + flow[:, :, 0]
-    map_y = grid_y + flow[:, :, 1]
-    warped_prev = cv2.remap(prev_alpha, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-    motion_mag = float(np.mean(np.linalg.norm(flow, axis=2)))
+    warped_prev, motion_mag = _warp_previous_alpha(prev_alpha, gray, prev_gray)
     motion_gate = float(np.clip(1.0 - (motion_mag / 5.8), 0.0, 1.0))
     blend_w = float(np.clip(strength * motion_gate, 0.0, 0.65))
     if blend_w <= 0.0:
@@ -677,10 +996,16 @@ def _quality_stats(edge_values: np.ndarray, area_values: np.ndarray, comp_values
     if len(edge_values) == 0:
         return RenderStats(0, 0.0, 0.0, 0.0, 0.0, 0, [])
     edge_thr = max(8.0, float(edge_values.mean() + 2.2 * (edge_values.std() + 1e-6)))
-    area_thr = max(0.10, float(area_values.mean() - 2.1 * (area_values.std() + 1e-6)))
+    area_mean = float(area_values.mean())
+    area_std = float(area_values.std())
     comp_thr = max(3, int(np.ceil(comp_values.mean() + 2.0 * (comp_values.std() + 1e-6))))
     sus_edge = np.where(edge_values > edge_thr)[0]
-    sus_area = np.where(area_values < area_thr)[0]
+    if area_mean < 0.02:
+        # For tiny subjects, area jitter is not a reliable quality signal.
+        sus_area = np.array([], dtype=np.int32)
+    else:
+        area_thr = max(0.01, float(area_mean - 2.1 * (area_std + 1e-6)))
+        sus_area = np.where(area_values < area_thr)[0]
     sus_comp = np.where(comp_values > comp_thr)[0]
     combined = sorted(set(sus_edge.tolist() + sus_area.tolist() + sus_comp.tolist()))
     return RenderStats(
@@ -702,6 +1027,12 @@ def _ffmpeg_cmd_transparent(
     height: int,
     fps: float,
 ) -> list[str]:
+    vp9_crf = int(np.clip(settings.engine_video_vp9_crf, 10, 40))
+    vp9_cpu_used = int(np.clip(settings.engine_video_vp9_cpu_used, 0, 8))
+    deadline = (settings.engine_video_vp9_deadline or "realtime").strip().lower()
+    if deadline not in {"realtime", "good", "best"}:
+        deadline = "realtime"
+    threads = int(max(0, settings.engine_video_vp9_threads))
     return [
         ffmpeg_bin,
         "-y",
@@ -723,16 +1054,20 @@ def _ffmpeg_cmd_transparent(
         "1:a:0?",
         "-c:v",
         "libvpx-vp9",
-        "-lossless",
-        "1",
+        "-b:v",
+        "0",
+        "-crf",
+        str(vp9_crf),
         "-pix_fmt",
         "yuva420p",
         "-row-mt",
         "1",
         "-deadline",
-        "good",
+        deadline,
         "-cpu-used",
-        "2",
+        str(vp9_cpu_used),
+        "-threads",
+        str(threads) if threads > 0 else "0",
         "-c:a",
         "libopus",
         "-b:a",
@@ -813,18 +1148,142 @@ def _draw_watermark_icon(canvas: np.ndarray, cx: int, cy: int, size: int, color:
     cv2.circle(canvas, (cx, cy), max(1, int(round(arm * 0.18))), color, -1, cv2.LINE_AA)
 
 
-def _watermark_layout(width: int, height: int, text: str) -> tuple[int, int, int, int, int, int, int, int]:
+def _watermark_layout(width: int, height: int, text: str) -> tuple[int, int, int, int, int, int, int, int, float, int, int]:
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.42, min(0.95, width / 1800.0))
-    thickness = max(1, int(round(scale * 2.0)))
-    icon_size = max(8, int(round(13 * scale)))
-    gap = max(5, int(round(7 * scale)))
-    margin = max(8, int(round(18 * scale)))
-    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    short_side = max(1, min(width, height))
+    font_scale = max(0.50, min(1.12, short_side / 880.0))
+    thickness = max(2, int(round(font_scale * 2.1)))
+    icon_size = max(10, int(round(15 * font_scale)))
+    gap = max(6, int(round(8 * font_scale)))
+    margin = max(10, int(round(22 * font_scale)))
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     total_w = icon_size * 2 + gap + text_w
+    total_h = text_h + baseline
     x = max(margin, width - total_w - margin)
     y = max(text_h + margin, height - margin)
-    return x, y, icon_size, gap, text_w, text_h, baseline, thickness
+    return x, y, icon_size, gap, text_w, text_h, baseline, thickness, font_scale, total_w, total_h
+
+
+def _watermark_patch_rgba(
+    text: str,
+    icon_size: int,
+    gap: int,
+    text_h: int,
+    thickness: int,
+    font_scale: float,
+    total_w: int,
+    total_h: int,
+) -> tuple[np.ndarray, int]:
+    # Draw watermark at higher resolution and downsample for cleaner edges.
+    supersample = 4
+    pad = max(5, int(round(icon_size * 0.42)))
+    patch_w = max(1, total_w + pad * 2)
+    patch_h = max(1, total_h + pad * 2)
+    hi_w = patch_w * supersample
+    hi_h = patch_h * supersample
+    hi = np.zeros((hi_h, hi_w, 4), dtype=np.uint8)
+
+    baseline_y = int(round((pad + text_h) * supersample))
+    icon_cx = int(round((pad + icon_size) * supersample))
+    icon_cy = int(round((pad + (text_h / 2.0)) * supersample))
+    text_x = int(round((pad + icon_size * 2 + gap) * supersample))
+    thickness_hi = max(2, int(round(thickness * supersample)))
+    icon_hi = max(6, int(round(icon_size * supersample)))
+    shadow_shift = max(1, int(round(supersample * 0.55)))
+
+    _draw_watermark_icon(
+        hi,
+        icon_cx + shadow_shift,
+        icon_cy + shadow_shift,
+        icon_hi,
+        (6, 12, 24, 132),
+        max(2, thickness_hi + 1),
+    )
+    _draw_watermark_icon(
+        hi,
+        icon_cx,
+        icon_cy,
+        icon_hi,
+        (130, 220, 255, 246),
+        thickness_hi,
+    )
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(
+        hi,
+        text,
+        (text_x + shadow_shift, baseline_y + shadow_shift),
+        font,
+        font_scale * supersample,
+        (6, 12, 24, 148),
+        max(2, thickness_hi + 1),
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        hi,
+        text,
+        (text_x, baseline_y),
+        font,
+        font_scale * supersample,
+        (244, 249, 255, 254),
+        thickness_hi,
+        cv2.LINE_AA,
+    )
+
+    patch = cv2.resize(hi, (patch_w, patch_h), interpolation=cv2.INTER_LANCZOS4)
+    return patch, pad
+
+
+def _blend_watermark_patch_bgr(frame_bgr: np.ndarray, patch_rgba: np.ndarray, x0: int, y0: int) -> np.ndarray:
+    out = frame_bgr.copy()
+    h, w = out.shape[:2]
+    ph, pw = patch_rgba.shape[:2]
+    x1 = x0 + pw
+    y1 = y0 + ph
+    cx0 = max(0, x0)
+    cy0 = max(0, y0)
+    cx1 = min(w, x1)
+    cy1 = min(h, y1)
+    if cx0 >= cx1 or cy0 >= cy1:
+        return out
+
+    sx0 = cx0 - x0
+    sy0 = cy0 - y0
+    sx1 = sx0 + (cx1 - cx0)
+    sy1 = sy0 + (cy1 - cy0)
+    src = patch_rgba[sy0:sy1, sx0:sx1]
+
+    alpha = src[:, :, 3:4].astype(np.float32) / 255.0
+    if float(alpha.max(initial=0.0)) <= 0.0:
+        return out
+    dst = out[cy0:cy1, cx0:cx1].astype(np.float32)
+    src_rgb = src[:, :, :3].astype(np.float32)
+    blended = src_rgb * alpha + dst * (1.0 - alpha)
+    out[cy0:cy1, cx0:cx1] = np.clip(blended, 0, 255).astype(np.uint8)
+    return out
+
+
+def _blend_watermark_patch_rgba(frame_rgba: np.ndarray, patch_rgba: np.ndarray, x0: int, y0: int) -> np.ndarray:
+    out = frame_rgba.copy()
+    h, w = out.shape[:2]
+    ph, pw = patch_rgba.shape[:2]
+    x1 = x0 + pw
+    y1 = y0 + ph
+    cx0 = max(0, x0)
+    cy0 = max(0, y0)
+    cx1 = min(w, x1)
+    cy1 = min(h, y1)
+    if cx0 >= cx1 or cy0 >= cy1:
+        return out
+
+    sx0 = cx0 - x0
+    sy0 = cy0 - y0
+    sx1 = sx0 + (cx1 - cx0)
+    sy1 = sy0 + (cy1 - cy0)
+    src = patch_rgba[sy0:sy1, sx0:sx1]
+    dst = out[cy0:cy1, cx0:cx1]
+    out[cy0:cy1, cx0:cx1] = _alpha_compose_rgba(dst, src)
+    return out
 
 
 def _apply_watermark_bgr(frame_bgr: np.ndarray, watermark_enabled: bool | None = None) -> np.ndarray:
@@ -838,28 +1297,18 @@ def _apply_watermark_bgr(frame_bgr: np.ndarray, watermark_enabled: bool | None =
     if h < 48 or w < 96:
         return frame_bgr
 
-    x, y, icon_size, gap, text_w, text_h, baseline, thickness = _watermark_layout(w, h, text)
-    box_pad = max(4, int(round(icon_size * 0.45)))
-    box_x0 = max(0, x - box_pad)
-    box_y0 = max(0, y - text_h - box_pad)
-    box_x1 = min(w - 1, x + icon_size * 2 + gap + text_w + box_pad)
-    box_y1 = min(h - 1, y + baseline + box_pad)
-
-    out = frame_bgr.copy()
-    overlay = out.copy()
-    cv2.rectangle(overlay, (box_x0, box_y0), (box_x1, box_y1), (8, 16, 34), -1, cv2.LINE_AA)
-    out = cv2.addWeighted(overlay, 0.34, out, 0.66, 0.0)
-
-    icon_cx = x + icon_size
-    icon_cy = y - (text_h // 2)
-    _draw_watermark_icon(out, icon_cx + 1, icon_cy + 1, icon_size, (10, 18, 38), max(1, thickness + 1))
-    _draw_watermark_icon(out, icon_cx, icon_cy, icon_size, (120, 210, 255), thickness)
-
-    text_x = x + icon_size * 2 + gap
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(out, text, (text_x + 1, y + 1), font, max(0.42, min(0.95, w / 1800.0)), (8, 16, 34), thickness + 1, cv2.LINE_AA)
-    cv2.putText(out, text, (text_x, y), font, max(0.42, min(0.95, w / 1800.0)), (232, 240, 255), thickness, cv2.LINE_AA)
-    return out
+    x, y, icon_size, gap, _, text_h, _, thickness, font_scale, total_w, total_h = _watermark_layout(w, h, text)
+    patch, pad = _watermark_patch_rgba(
+        text=text,
+        icon_size=icon_size,
+        gap=gap,
+        text_h=text_h,
+        thickness=thickness,
+        font_scale=font_scale,
+        total_w=total_w,
+        total_h=total_h,
+    )
+    return _blend_watermark_patch_bgr(frame_bgr, patch, x - pad, y - text_h - pad)
 
 
 def _alpha_compose_rgba(base: np.ndarray, overlay: np.ndarray) -> np.ndarray:
@@ -884,27 +1333,18 @@ def _apply_watermark_rgba(frame_rgba: np.ndarray, watermark_enabled: bool | None
     if h < 48 or w < 96:
         return frame_rgba
 
-    x, y, icon_size, gap, text_w, text_h, baseline, thickness = _watermark_layout(w, h, text)
-    wm = np.zeros_like(frame_rgba, dtype=np.uint8)
-
-    box_pad = max(4, int(round(icon_size * 0.45)))
-    box_x0 = max(0, x - box_pad)
-    box_y0 = max(0, y - text_h - box_pad)
-    box_x1 = min(w - 1, x + icon_size * 2 + gap + text_w + box_pad)
-    box_y1 = min(h - 1, y + baseline + box_pad)
-    cv2.rectangle(wm, (box_x0, box_y0), (box_x1, box_y1), (8, 16, 34, 132), -1, cv2.LINE_AA)
-
-    icon_cx = x + icon_size
-    icon_cy = y - (text_h // 2)
-    _draw_watermark_icon(wm, icon_cx + 1, icon_cy + 1, icon_size, (10, 18, 38, 220), max(1, thickness + 1))
-    _draw_watermark_icon(wm, icon_cx, icon_cy, icon_size, (120, 210, 255, 220), thickness)
-
-    text_x = x + icon_size * 2 + gap
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(wm, text, (text_x + 1, y + 1), font, max(0.42, min(0.95, w / 1800.0)), (8, 16, 34, 220), thickness + 1, cv2.LINE_AA)
-    cv2.putText(wm, text, (text_x, y), font, max(0.42, min(0.95, w / 1800.0)), (232, 240, 255, 220), thickness, cv2.LINE_AA)
-
-    return _alpha_compose_rgba(frame_rgba, wm)
+    x, y, icon_size, gap, _, text_h, _, thickness, font_scale, total_w, total_h = _watermark_layout(w, h, text)
+    patch, pad = _watermark_patch_rgba(
+        text=text,
+        icon_size=icon_size,
+        gap=gap,
+        text_h=text_h,
+        thickness=thickness,
+        font_scale=font_scale,
+        total_w=total_w,
+        total_h=total_h,
+    )
+    return _blend_watermark_patch_rgba(frame_rgba, patch, x - pad, y - text_h - pad)
 
 
 def _render_with_params(
@@ -921,6 +1361,8 @@ def _render_with_params(
     main_max_side: int,
     aux_max_side: int,
     rescue_max_side: int,
+    video_infer_stride: int,
+    strict_enabled: bool,
 ) -> RenderStats:
     cmd = (
         _ffmpeg_cmd_transparent(ffmpeg_bin, video_path, output_video, meta.width, meta.height, meta.fps)
@@ -930,6 +1372,18 @@ def _render_with_params(
     session_main = _session_for(params.main_model)
     session_aux = _session_for(params.aux_model) if params.aux_model else None
     session_rescue = _session_for(params.rescue_model) if params.rescue_model else None
+    strict_session = None
+    strict_threshold = max(0, int(settings.engine_ultra_strict_threshold))
+    strict_ratio = float(np.clip(float(settings.engine_ultra_strict_max_ratio_pct) / 100.0, 0.0, 1.0))
+    strict_max_side = int(settings.engine_strict_model_max_side)
+    if strict_max_side <= 0:
+        strict_max_side = int(max(512, main_max_side))
+    strict_model = (settings.engine_ultra_strict_model or "").strip()
+    if strict_enabled and strict_model and strict_model not in {params.main_model, params.aux_model or ""}:
+        try:
+            strict_session = _session_for(strict_model)
+        except Exception:  # noqa: BLE001
+            strict_session = None
     min_area_px = int((meta.width * meta.height) * (params.min_blob_percent / 100.0))
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -939,6 +1393,11 @@ def _render_with_params(
     prev_lock = None
     prev_gray = None
     h, w = meta.height, meta.width
+    accessory_recover_enabled = bool(settings.engine_video_accessory_recover)
+    proximity_ratio = float(np.clip(settings.engine_video_accessory_proximity_ratio, 0.01, 0.16))
+    min_area_ratio = float(np.clip(settings.engine_video_accessory_min_area_ratio, 0.00003, 0.002))
+    accessory_proximity_px = max(13, int(min(h, w) * proximity_ratio))
+    accessory_min_area = max(96, int((h * w) * min_area_ratio))
     edge_band = max(8, int(min(h, w) * 0.08))
     edge_mask = np.zeros((h, w), dtype=np.uint8)
     edge_mask[:edge_band, :] = 1
@@ -948,64 +1407,122 @@ def _render_with_params(
     edge_values: list[float] = []
     area_values: list[float] = []
     comp_values: list[float] = []
+    frame_index = 0
+    total_frames = max(1, int(meta.frame_count))
+    infer_stride = max(1, int(video_infer_stride))
+    fps_cap = max(0, int(settings.engine_video_process_fps_cap))
+    if fps_cap > 0 and meta.fps > fps_cap:
+        fps_stride = max(1, int(np.ceil(meta.fps / float(fps_cap))))
+        infer_stride = max(infer_stride, fps_stride)
+    strict_budget = max(0, int(total_frames * strict_ratio)) if strict_enabled else 0
+    strict_used = 0
+    grabcut_frame_stride = max(1, int(settings.engine_grabcut_frame_stride))
+    motion_refresh_threshold = float(max(2.0, settings.engine_video_motion_refresh_threshold))
+    qc_stride = max(1, int(settings.engine_video_qc_sample_stride))
     try:
         while True:
             ok, frame_bgr = cap.read()
             if not ok:
                 break
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            alpha_main = _infer_alpha(session_main, frame_rgb, max_side=main_max_side)
-            alpha = alpha_main
+            frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            should_infer = prev_alpha is None or prev_gray is None or (frame_index % infer_stride == 0)
+            alpha = None
+            reference_alpha = None
             aux_disagreement = 0.0
-            if session_aux is not None:
-                aux_alpha = _infer_alpha(session_aux, frame_rgb, max_side=aux_max_side)
-                aux_disagreement = float(np.mean(np.abs(alpha_main.astype(np.int16) - aux_alpha.astype(np.int16))))
-                alpha = _fuse_alpha_maps(
-                    alpha_main,
-                    aux_alpha,
-                    main_model=params.main_model,
-                    aux_model=params.aux_model or params.main_model,
-                )
+            bg_mask = None
+            protect_zone = None
+            if not should_infer and prev_alpha is not None and prev_gray is not None:
+                propagated_alpha, motion_mag = _warp_previous_alpha(prev_alpha, frame_gray, prev_gray)
+                if motion_mag <= motion_refresh_threshold:
+                    alpha = propagated_alpha
+                else:
+                    should_infer = True
 
-            bg_mask = _border_connected_bg_mask(frame_rgb, border_model, dist_multiplier=params.border_distance_multiplier)
-            sure_fg = (alpha >= 225).astype(np.uint8) * 255
-            main_fg = _largest_component(sure_fg)
-            if params.protect_dilate_px > 0:
-                k = params.protect_dilate_px
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-                protect_zone = cv2.dilate(main_fg, kernel, iterations=1)
+            if should_infer:
+                alpha_main = _infer_alpha(session_main, frame_rgb, max_side=main_max_side)
+                alpha = alpha_main
+                reference_alpha = alpha_main
+                if session_aux is not None:
+                    aux_alpha = _infer_alpha(session_aux, frame_rgb, max_side=aux_max_side)
+                    aux_disagreement = float(np.mean(np.abs(alpha_main.astype(np.int16) - aux_alpha.astype(np.int16))))
+                    reference_alpha = np.maximum(reference_alpha, aux_alpha)
+                    alpha = _fuse_alpha_maps(
+                        alpha_main,
+                        aux_alpha,
+                        main_model=params.main_model,
+                        aux_model=params.aux_model or params.main_model,
+                    )
+
+                if (
+                    strict_session is not None
+                    and strict_used < strict_budget
+                    and strict_threshold > 0
+                ):
+                    leak_probe = _border_connected_bg_mask(
+                        frame_rgb,
+                        border_model=border_model,
+                        dist_multiplier=params.border_distance_multiplier,
+                    )
+                    if _strict_needed(alpha, leak_probe > 0, strict_threshold):
+                        try:
+                            strict_alpha = _infer_alpha(strict_session, frame_rgb, max_side=strict_max_side)
+                            alpha = _merge_strict_alpha(alpha, strict_alpha)
+                            strict_used += 1
+                        except Exception:  # noqa: BLE001
+                            strict_session = None
+            if alpha is None:
+                alpha = np.zeros((h, w), dtype=np.uint8)
+
+            if should_infer:
+                bg_mask = _border_connected_bg_mask(frame_rgb, border_model, dist_multiplier=params.border_distance_multiplier)
+                sure_fg = (alpha >= 225).astype(np.uint8) * 255
+                main_fg = _largest_component(sure_fg)
+                if params.protect_dilate_px > 0:
+                    k = params.protect_dilate_px
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                    protect_zone = cv2.dilate(main_fg, kernel, iterations=1)
+                else:
+                    protect_zone = main_fg
+
+                suppress = (bg_mask > 0) & (protect_zone == 0) & (alpha < params.border_alpha_guard)
+                alpha[suppress] = 0
+                edge_now = float(alpha[edge_mask > 0].mean())
+                if edge_now > 6.0:
+                    hard_suppress = (bg_mask > 0) & (protect_zone == 0) & (alpha < 252)
+                    alpha[hard_suppress] = 0
+                fg_lock = _temporal_fg_lock(alpha, prev_lock)
             else:
-                protect_zone = main_fg
-
-            suppress = (bg_mask > 0) & (protect_zone == 0) & (alpha < params.border_alpha_guard)
-            alpha[suppress] = 0
-            edge_now = float(alpha[edge_mask > 0].mean())
-            if edge_now > 6.0:
-                hard_suppress = (bg_mask > 0) & (protect_zone == 0) & (alpha < 252)
-                alpha[hard_suppress] = 0
-
-            fg_lock = _temporal_fg_lock(alpha, prev_lock)
+                fg_lock = prev_lock if prev_lock is not None else np.where(alpha > 110, 255, 0).astype(np.uint8)
             keep_zone = cv2.dilate(fg_lock, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)), iterations=1)
             alpha[(keep_zone == 0) & (alpha < 248)] = 0
-            alpha = _grabcut_refine(frame_bgr, alpha, iterations=params.grabcut_iterations)
+            alpha = _suppress_border_components(alpha, protect_zone=protect_zone, alpha_min=56)
+            grabcut_iters = 0
+            if should_infer and params.grabcut_iterations > 0 and (frame_index % grabcut_frame_stride == 0):
+                grabcut_iters = params.grabcut_iterations
+            if grabcut_iters > 0:
+                alpha = _grabcut_refine(frame_bgr, alpha, iterations=grabcut_iters)
             alpha = _apply_manual_masks(alpha, erase_mask=erase_mask, keep_mask=keep_mask)
-            alpha, frame_gray = _flow_guided_temporal_blend(
-                alpha,
-                prev_alpha=prev_alpha,
-                frame_bgr=frame_bgr,
-                prev_gray=prev_gray,
-                strength=params.temporal_flow_strength,
-            )
+            if should_infer:
+                alpha, frame_gray = _flow_guided_temporal_blend(
+                    alpha,
+                    prev_alpha=prev_alpha,
+                    frame_bgr=frame_bgr,
+                    prev_gray=prev_gray,
+                    strength=params.temporal_flow_strength,
+                )
             alpha = _refine_alpha(
                 alpha,
-                feather_strength=params.feather_strength,
-                alpha_cutoff=params.alpha_cutoff,
+                feather_strength=params.feather_strength if should_infer else float(max(0.55, params.feather_strength * 0.55)),
+                alpha_cutoff=params.alpha_cutoff if should_infer else int(max(118, params.alpha_cutoff - 24)),
                 min_area_px=min_area_px,
                 keep_largest=params.keep_largest_component,
-                temporal_smooth=params.temporal_smooth,
+                temporal_smooth=params.temporal_smooth if should_infer else float(max(params.temporal_smooth, 0.34)),
                 prev_alpha=prev_alpha,
             )
-            alpha = _edge_aware_refine(alpha, frame_bgr=frame_bgr, strength=params.edge_refine_strength)
+            edge_refine_due = should_infer or (frame_index % max(3, infer_stride * 2) == 0)
+            if edge_refine_due:
+                alpha = _edge_aware_refine(alpha, frame_bgr=frame_bgr, strength=params.edge_refine_strength)
 
             if prev_alpha is not None:
                 cur_edge = float(alpha[edge_mask > 0].mean())
@@ -1020,6 +1537,8 @@ def _render_with_params(
 
             cur_edge = float(alpha[edge_mask > 0].mean())
             if (
+                should_infer
+                and
                 session_rescue is not None
                 and params.frame_recheck_enabled
                 and (
@@ -1049,11 +1568,25 @@ def _render_with_params(
                 if rescue_edge + 0.35 < cur_edge:
                     alpha = rescue_fused
 
-            fg = (alpha > 128).astype(np.uint8)
-            edge_values.append(float(alpha[edge_mask > 0].mean()))
-            area_values.append(float(fg.mean()))
-            num_comp, _, _, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
-            comp_values.append(float(num_comp - 1))
+            if (
+                should_infer
+                and accessory_recover_enabled
+                and reference_alpha is not None
+            ):
+                alpha = _recover_near_subject_components(
+                    alpha=alpha,
+                    reference_alpha=reference_alpha,
+                    proximity_px=accessory_proximity_px,
+                    min_component_area=accessory_min_area,
+                )
+
+            if frame_index % qc_stride == 0:
+                fg = (alpha > 128).astype(np.uint8)
+                edge_values.append(float(alpha[edge_mask > 0].mean()))
+                area_values.append(float(fg.mean()))
+                qc_fg = fg if max(h, w) <= 960 else cv2.resize(fg, (max(1, w // 2), max(1, h // 2)), interpolation=cv2.INTER_NEAREST)
+                num_comp, _, _, _ = cv2.connectedComponentsWithStats(qc_fg, connectivity=8)
+                comp_values.append(float(num_comp - 1))
 
             if bg_rgb is None:
                 rgba = np.dstack([frame_rgb, alpha]).astype(np.uint8)
@@ -1072,6 +1605,7 @@ def _render_with_params(
             prev_alpha = alpha
             prev_lock = np.where(alpha > 120, 255, 0).astype(np.uint8)
             prev_gray = frame_gray
+            frame_index += 1
     except Exception as exc:  # noqa: BLE001
         proc.kill()
         raise RuntimeError(f"Render failed: {exc}") from exc
@@ -1105,7 +1639,7 @@ def _prepare_auto_pipeline(video_path: Path, quality: str):
     if not sample_frames:
         raise RuntimeError("No sample frames.")
     border_model = _build_border_model(sample_frames, border_ratio=0.08, k=4)
-    main_model, aux_model, rescue_model, cache = _choose_models_and_cache(sample_frames, quality=quality)
+    main_model, aux_model, rescue_model, cache = _choose_models_and_cache(sample_frames, quality=quality, meta=meta)
     params = _auto_params(
         quality=quality,
         sample_frames=sample_frames,
@@ -1118,6 +1652,45 @@ def _prepare_auto_pipeline(video_path: Path, quality: str):
     return meta, border_model, params
 
 
+def _video_infer_stride(quality: str, meta: VideoMeta) -> int:
+    q = (quality or "").strip().lower()
+    base = settings.engine_video_infer_stride_ultra if q == "ultra" else settings.engine_video_infer_stride_balanced
+    stride = max(1, min(12, int(base)))
+    if meta.fps >= 45.0:
+        stride = min(12, stride + 1)
+    if meta.frame_count >= 360:
+        stride = min(12, stride + 1)
+    if _runtime_is_cpu():
+        target_keyframes = settings.engine_video_cpu_max_keyframes_ultra if q == "ultra" else settings.engine_video_cpu_max_keyframes_balanced
+        target_keyframes = max(6, int(target_keyframes))
+        stride = max(stride, int(np.ceil(max(1, meta.frame_count) / float(target_keyframes))))
+        if q == "ultra" and meta.fps >= 30.0:
+            stride = max(stride, 6)
+    return stride
+
+
+def _video_pass_count(quality: str, meta: VideoMeta) -> int:
+    if (quality or "").strip().lower() != "ultra":
+        return 1
+    configured = max(1, int(settings.engine_ultra_max_passes))
+    if _runtime_is_cpu():
+        configured = min(configured, 1)
+    if meta.fps >= 45.0 or meta.frame_count >= 300:
+        configured = min(configured, 1)
+    return configured
+
+
+def _should_qc_retry(quality: str, stats: RenderStats | None) -> bool:
+    if stats is None:
+        return False
+    if (quality or "").strip().lower() != "ultra":
+        return False
+    if _runtime_is_cpu():
+        return False
+    threshold = max(1, int(settings.engine_video_qc_retry_threshold))
+    return len(stats.suspect_frames) >= threshold
+
+
 def process_video(
     video_path: Path,
     output_path: Path,
@@ -1127,14 +1700,55 @@ def process_video(
     bg_rgb: tuple[int, int, int] | None = None,
     watermark_enabled: bool | None = None,
 ) -> dict:
+    started_at = time.perf_counter()
     ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
     if not Path(ffmpeg_bin).exists():
         raise RuntimeError("ffmpeg binary not found.")
 
     meta, border_model, params = _prepare_auto_pipeline(video_path, quality=quality)
+    infer_stride = _video_infer_stride(quality, meta)
+    max_passes = _video_pass_count(quality, meta)
+    logger.info(
+        "video.pipeline.start quality=%s fps=%.3f frames=%s size=%sx%s infer_stride=%s max_passes=%s main_model=%s aux_model=%s rescue_model=%s cpu_mode=%s",
+        quality,
+        meta.fps,
+        meta.frame_count,
+        meta.width,
+        meta.height,
+        infer_stride,
+        max_passes,
+        params.main_model,
+        params.aux_model,
+        params.rescue_model,
+        _runtime_is_cpu(),
+    )
+    disable_grabcut = bool(settings.engine_video_disable_grabcut) or (
+        _runtime_is_cpu() and settings.engine_video_cpu_disable_grabcut
+    )
+    disable_recheck = _runtime_is_cpu() and settings.engine_video_cpu_disable_recheck
+    if disable_grabcut or disable_recheck:
+        params = AutoParams(
+            main_model=params.main_model,
+            aux_model=params.aux_model,
+            rescue_model=params.rescue_model,
+            feather_strength=params.feather_strength,
+            alpha_cutoff=params.alpha_cutoff,
+            min_blob_percent=params.min_blob_percent,
+            temporal_smooth=params.temporal_smooth,
+            temporal_flow_strength=params.temporal_flow_strength,
+            edge_refine_strength=params.edge_refine_strength,
+            grabcut_iterations=0 if disable_grabcut else params.grabcut_iterations,
+            keep_largest_component=params.keep_largest_component,
+            border_distance_multiplier=params.border_distance_multiplier,
+            border_alpha_guard=params.border_alpha_guard,
+            protect_dilate_px=params.protect_dilate_px,
+            frame_recheck_enabled=(False if disable_recheck else params.frame_recheck_enabled),
+            frame_recheck_edge_threshold=params.frame_recheck_edge_threshold,
+            frame_recheck_disagreement_threshold=params.frame_recheck_disagreement_threshold,
+        )
     params_list = [params]
     if quality == "ultra":
-        extra_passes = max(0, int(settings.engine_ultra_max_passes) - 1)
+        extra_passes = max(0, max_passes - 1)
         for _ in range(extra_passes):
             params_list.append(_tighten_auto_params(params_list[-1]))
 
@@ -1173,8 +1787,20 @@ def process_video(
             main_max_side=_inference_side_limit(quality, "video"),
             aux_max_side=960,
             rescue_max_side=960,
+            video_infer_stride=infer_stride,
+            strict_enabled=((quality or "").strip().lower() == "ultra"),
         )
         passes_run += 1
+        logger.info(
+            "video.pipeline.pass_done pass=%s quality=%s qc_suspect=%s edge_leak_mean=%.3f edge_leak_max=%.3f area_mean=%.4f comp_max=%s",
+            idx,
+            quality,
+            len(pass_stats.suspect_frames),
+            pass_stats.edge_leak_mean,
+            pass_stats.edge_leak_max,
+            pass_stats.area_mean,
+            pass_stats.comp_max,
+        )
         if best_stats is None:
             best_video = pass_video
             best_stats = pass_stats
@@ -1189,11 +1815,65 @@ def process_video(
         if quality != "ultra":
             break
 
+    if best_video is not None and best_stats is not None and best_params is not None and _should_qc_retry(quality, best_stats):
+        retry_params = _tighten_auto_params(best_params)
+        stride_delta = max(0, int(settings.engine_video_qc_retry_infer_stride_delta))
+        retry_infer_stride = max(1, infer_stride - stride_delta)
+        retry_video = output_dir / f"{output_path.stem}_qcretry{suffix}"
+        logger.info(
+            "video.pipeline.qc_retry.start quality=%s suspect=%s edge_leak_mean=%.3f infer_stride=%s->%s",
+            quality,
+            len(best_stats.suspect_frames),
+            best_stats.edge_leak_mean,
+            infer_stride,
+            retry_infer_stride,
+        )
+        retry_stats = _render_with_params(
+            video_path=video_path,
+            output_video=retry_video,
+            ffmpeg_bin=ffmpeg_bin,
+            meta=meta,
+            border_model=border_model,
+            params=retry_params,
+            erase_mask=erase_mask,
+            keep_mask=keep_mask,
+            bg_rgb=bg_rgb,
+            watermark_enabled=watermark_enabled,
+            main_max_side=_inference_side_limit(quality, "video"),
+            aux_max_side=960,
+            rescue_max_side=960,
+            video_infer_stride=retry_infer_stride,
+            strict_enabled=((quality or "").strip().lower() == "ultra"),
+        )
+        passes_run += 1
+        logger.info(
+            "video.pipeline.qc_retry.done quality=%s qc_suspect=%s edge_leak_mean=%.3f",
+            quality,
+            len(retry_stats.suspect_frames),
+            retry_stats.edge_leak_mean,
+        )
+        prev_key = (len(best_stats.suspect_frames), best_stats.edge_leak_mean, best_stats.comp_max)
+        cur_key = (len(retry_stats.suspect_frames), retry_stats.edge_leak_mean, retry_stats.comp_max)
+        if cur_key < prev_key:
+            best_video = retry_video
+            best_stats = retry_stats
+            best_params = retry_params
+
     if best_video is None or best_stats is None or best_params is None:
         raise RuntimeError("Video processing terminated unexpectedly.")
     if output_path.exists():
         output_path.unlink()
     best_video.replace(output_path)
+    elapsed = time.perf_counter() - started_at
+    logger.info(
+        "video.pipeline.completed quality=%s elapsed_sec=%.3f passes_run=%s selected_model=%s selected_aux=%s qc_suspect=%s",
+        quality,
+        elapsed,
+        passes_run,
+        best_params.main_model,
+        best_params.aux_model,
+        len(best_stats.suspect_frames),
+    )
     return {
         "output_path": str(output_path),
         "main_model": best_params.main_model,
@@ -1237,12 +1917,14 @@ def process_image(
     session_main = _session_for(params.main_model)
     alpha_main = _infer_alpha(session_main, frame_rgb, max_side=_inference_side_limit(quality, "image"))
     alpha = alpha_main
+    reference_alpha = alpha_main.copy()
     aux_disagreement = 0.0
     if params.aux_model:
         session_aux = _session_for(params.aux_model)
         aux_alpha = _infer_alpha(session_aux, frame_rgb, max_side=1280)
         aux_disagreement = float(np.mean(np.abs(alpha_main.astype(np.int16) - aux_alpha.astype(np.int16))))
         alpha = _fuse_alpha_maps(alpha_main, aux_alpha, params.main_model, params.aux_model)
+        reference_alpha = np.maximum(reference_alpha, aux_alpha)
 
     bg_mask = _border_connected_bg_mask(frame_rgb, border_model=border_model, dist_multiplier=params.border_distance_multiplier)
     sure_fg = (alpha >= 225).astype(np.uint8) * 255
@@ -1260,11 +1942,13 @@ def process_image(
         feather_strength=params.feather_strength,
         alpha_cutoff=params.alpha_cutoff,
         min_area_px=min_area_px,
-        keep_largest=params.keep_largest_component,
+        keep_largest=False,
         temporal_smooth=0.0,
         prev_alpha=None,
     )
     alpha = _edge_aware_refine(alpha, frame_bgr=frame_bgr, strength=params.edge_refine_strength)
+    alpha = _soft_edge_matte(alpha, strength=float(np.clip(0.20 + (params.edge_refine_strength * 0.62), 0.20, 0.88)))
+    alpha = _apply_manual_masks(alpha, erase_mask=erase_mask, keep_mask=keep_mask)
 
     edge_band = max(8, int(min(h, w) * 0.08))
     edge_mask = np.zeros((h, w), dtype=np.uint8)
@@ -1289,14 +1973,27 @@ def process_image(
             feather_strength=params.feather_strength,
             alpha_cutoff=params.alpha_cutoff,
             min_area_px=min_area_px,
-            keep_largest=params.keep_largest_component,
+            keep_largest=False,
             temporal_smooth=0.0,
             prev_alpha=None,
         )
         candidate = _edge_aware_refine(candidate, frame_bgr=frame_bgr, strength=params.edge_refine_strength)
+        candidate = _soft_edge_matte(candidate, strength=float(np.clip(0.20 + (params.edge_refine_strength * 0.62), 0.20, 0.88)))
+        candidate = _apply_manual_masks(candidate, erase_mask=erase_mask, keep_mask=keep_mask)
         candidate_leak = float(candidate[edge_mask > 0].mean())
         if candidate_leak + 0.35 < leak_before_rescue:
             alpha = candidate
+            reference_alpha = np.maximum(reference_alpha, rescue_alpha)
+
+    proximity_px = max(19, int(min(h, w) * 0.05))
+    min_accessory_area = max(160, int((w * h) * 0.00018))
+    alpha = _recover_near_subject_components(
+        alpha=alpha,
+        reference_alpha=reference_alpha,
+        proximity_px=proximity_px,
+        min_component_area=min_accessory_area,
+    )
+    alpha = _apply_manual_masks(alpha, erase_mask=erase_mask, keep_mask=keep_mask)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if bg_rgb is None:

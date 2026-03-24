@@ -104,7 +104,7 @@ def validate_image_file(path: Path, max_mb: int):
         )
 
 
-def validate_video_file(path: Path, max_mb: int, max_seconds: int):
+def validate_video_file(path: Path, max_mb: int, max_seconds: int) -> dict[str, float | int]:
     if not path.exists():
         raise HTTPException(status_code=400, detail="Video file missing.")
     size_mb = path.stat().st_size / (1024 * 1024)
@@ -136,6 +136,13 @@ def validate_video_file(path: Path, max_mb: int, max_seconds: int):
             status_code=413,
             detail=f"Video duration exceeds {max_seconds} seconds.",
         )
+    return {
+        "fps": fps,
+        "frames": frames,
+        "width": width,
+        "height": height,
+        "duration": duration,
+    }
 
 
 def data_url_to_gray_mask(data_url: str | None) -> np.ndarray | None:
